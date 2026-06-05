@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='pymadoka',
-    version='0.2.13',
+    version='0.2.14',
     py_modules=['pymadoka'],
     author = "Manuel Durán",
     author_email = "manuelduran@gmail.com",
@@ -15,7 +15,7 @@ setup(
         'click',
         'bleak',
         'pyyaml',
-        'asyncio-mqtt'
+        'paho-mqtt>=2.1.0'
     ],
     entry_points='''
         [console_scripts]

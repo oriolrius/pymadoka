@@ -10,6 +10,27 @@ What does it provide?
 * CLI tool to control the device (pymadoka)
 * CLI tool to bridge the device with MQTT (pymadoka-mqtt)
 
+## Fork notes (oriolrius)
+
+This fork modernises the stack so the MQTT bridge runs on the **current**
+paho-mqtt and bleak:
+
+* **paho-mqtt >= 2.0 support.** The bridge now builds its client with the
+  VERSION2 callback API (`callback_api_version=CallbackAPIVersion.VERSION2`) and
+  the connect/disconnect callbacks use the VERSION2 signatures + `ReasonCode`.
+  Upstream called `mqtt.Client(client_id=...)` which raised `TypeError` on
+  paho-mqtt 2.0 and emitted deprecation warnings on 2.1+ (and would break on 3.0).
+* Dropped the unused `asyncio-mqtt` dependency (it pinned `paho-mqtt<2`); the
+  bridge talks to `paho.mqtt` directly. Now requires `paho-mqtt>=2.1.0`.
+* Fixed a removed-API import (`from bleak import ... discover`) so the package
+  imports on current `bleak`.
+* Fixed two latent bugs: the `ssl: true` path referenced a non-existent
+  `mqtt.TLS_CERT_PATH`, and availability/state publishing tested the
+  `client.is_connected` *method object* instead of calling `is_connected()`.
+* Added a `pytest` suite (`tests/`) and CI covering the paho-mqtt 2.x regression,
+  topic construction, and the command-decoding path.
+
+Run the tests with `pytest`.
 
 # Installation
 ```
