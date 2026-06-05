@@ -24,6 +24,33 @@ logger = logging.getLogger(__name__)
 
 # Taken from paho-mqtt examples to integrate with asyncio loop
 
+def build_client(client_id: str) -> mqtt.Client:
+    """Create a paho-mqtt client using the modern (paho-mqtt >= 2.0) callback API.
+
+    paho-mqtt 2.0 made ``callback_api_version`` a mandatory argument and 3.0 will
+    drop the legacy VERSION1 callbacks entirely, so we target VERSION2 explicitly.
+    This keeps the bridge working (and deprecation-warning-free) on the latest
+    paho-mqtt while the callbacks below use the VERSION2 signatures.
+    """
+    return mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=client_id,
+    )
+
+
+def reason_is_success(reason_code) -> bool:
+    """Return True if a paho-mqtt result represents success.
+
+    paho-mqtt 2.x hands VERSION2 callbacks a ``ReasonCode`` object exposing an
+    ``is_failure`` property; we also accept a plain ``int`` (0 == success) so the
+    helper stays easy to unit-test.
+    """
+    is_failure = getattr(reason_code, "is_failure", None)
+    if is_failure is not None:
+        return not is_failure
+    return reason_code == 0
+
+
 class AsyncioHelper:
     def __init__(self, loop, client):
         self.loop = loop
@@ -297,14 +324,16 @@ class MQTT:
         if "id" in self.mqtt_cfg:
             id = self.mqtt_cfg["id"]
 
-        self.client:mqtt.Client = mqtt.Client(client_id = id)
+        self.client:mqtt.Client = build_client(id)
         if "username" in self.mqtt_cfg:
             self.client.username_pw_set(username=self.mqtt_cfg["username"],password=self.mqtt_cfg["password"])
        
         if self.mqtt_cfg["ssl"]:
-            self.client.tls_set(ca_certs=mqtt.TLS_CERT_PATH, certfile=None,
-                                keyfile=None, cert_reqs=mqtt.ssl.CERT_REQUIRED,
-                                tls_version=mqtt.ssl.PROTOCOL_TLSv1_2, ciphers=None)
+            # Use the system CA store and a modern TLS version. The previous code
+            # referenced a non-existent ``mqtt.TLS_CERT_PATH`` which raised
+            # AttributeError the moment SSL was enabled.
+            self.client.tls_set(cert_reqs=mqtt.ssl.CERT_REQUIRED,
+                                tls_version=mqtt.ssl.PROTOCOL_TLS_CLIENT)
             self.client.tls_insecure_set(False)
         
         try:
@@ -336,9 +365,9 @@ class MQTT:
             self.client.disconnect()
        
     
-    def on_connect(self,client, userdata, flags, rc):
-        """ Connection established callback. See paho-mqtt docs for more details. """
-        self.connected = rc == 0
+    def on_connect(self, client, userdata, flags, reason_code, properties=None):
+        """ Connection established callback (paho-mqtt VERSION2 API). """
+        self.connected = reason_is_success(reason_code)
         if self.connect_future:
             self.connect_future.set_result(self.connected)
         if self.connected: 
@@ -346,9 +375,9 @@ class MQTT:
             self.start()
         self.available(self.controller.connection.connection_status == ConnectionStatus.CONNECTED)
 
-    def on_disconnect(self,client, userdata, rc):
-        """ Connection established callback. See paho-mqtt docs for more details. """
-        logger.debug(f"Disconnected from MQTT broker ({rc})")
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        """ Disconnection callback (paho-mqtt VERSION2 API). """
+        logger.debug(f"Disconnected from MQTT broker ({reason_code})")
         asyncio.create_task(self.reconnect())
 
     async def reconnect(self):
@@ -405,7 +434,7 @@ class MQTT:
         Args:
             status (str): New status
         """           
-        if not self.client.is_connected:
+        if not self.client.is_connected():
             logger.debug("MQTT broker is not available. Skipping message...")
         else:
             device_topic = self.get_device_topic()
@@ -419,7 +448,7 @@ class MQTT:
         Args:
             status (str): New status
         """           
-        if not self.client.is_connected:
+        if not self.client.is_connected():
             logger.debug("MQTT broker is not available. Skipping message...")
         else:
             if "discovery_topic" in self.mqtt_cfg:
