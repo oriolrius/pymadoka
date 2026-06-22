@@ -8,9 +8,11 @@ import yaml
 
 import paho.mqtt.client as mqtt
 from paho.mqtt import MQTTException
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from functools import wraps
+from dbus_fast.aio import MessageBus
+from dbus_fast import BusType
 from pymadoka.connection import Connection, ConnectionStatus, ConnectionException, discover_devices, force_device_disconnect
 from pymadoka.controller import Controller
 from pymadoka.features.fanspeed import FanSpeedEnum, FanSpeedStatus
@@ -123,8 +125,10 @@ async def set_fan_speed(controller:Controller,payload:str):
     try:
 
         value = payload.decode("utf-8").upper()
-        new_cooling_fan_speed = controller.fan_speed.status.cooling_fan_speed
-        new_heating_fan_speed = controller.fan_speed.status.heating_fan_speed
+        # .cooling_fan_speed / .heating_fan_speed are FanSpeedEnum members, not
+        # strings — FanSpeedEnum[enum_member] raises KeyError, so extract .name.
+        new_cooling_fan_speed = controller.fan_speed.status.cooling_fan_speed.name
+        new_heating_fan_speed = controller.fan_speed.status.heating_fan_speed.name
         if (controller.operation_mode.status.operation_mode == OperationModeEnum.AUTO or
            controller.operation_mode.status.operation_mode == OperationModeEnum.DRY or
            controller.operation_mode.status.operation_mode == OperationModeEnum.FAN):
@@ -383,11 +387,19 @@ class MQTT:
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
         """ Connection established callback (paho-mqtt VERSION2 API). """
         self.connected = reason_is_success(reason_code)
-        if self.connect_future:
+        if self.connect_future is not None and not self.connect_future.done():
             self.connect_future.set_result(self.connected)
-        if self.connected: 
-            logger.debug("Connected to MQTT broker")
+        if self.connected:
+            logger.info("Connected to MQTT broker")
             self.start()
+            # NOTE: discovery() and discovery_sensors() are intentionally NOT
+            # called here. on_connect runs synchronously inside the asyncio
+            # reader callback — paho can queue publishes here, but the only way
+            # to flush them is to yield the loop. wait_for_publish() would
+            # block the loop and the PUBACK would never arrive. The caller in
+            # run() handles discovery after awaiting connect, with explicit
+            # asyncio.sleep() yields between batches so the socket writer
+            # callback gets time to push the bytes out.
         self.available(self.controller.connection.connection_status == ConnectionStatus.CONNECTED)
 
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
@@ -436,12 +448,16 @@ class MQTT:
         """
         Send the status to the availability topic
         Args:
-            status (bool): True if available, False otherwise       
+            status (bool): True if available, False otherwise
         """
+        if self.client is None or not self.client.is_connected():
+            return
         device_topic = self.get_device_topic()
         topic = "/".join([device_topic, self.AVAILABLE_TOPIC])
-        
-        self.client.publish(topic,"0" if not status else "1",retain=True)
+        try:
+            self.client.publish(topic,"0" if not status else "1",qos=1,retain=True)
+        except Exception as e:
+            logger.warning(f"available() publish failed: {e}")
 
     def update(self, status:str):
         """
@@ -476,7 +492,153 @@ class MQTT:
                                             self.mqtt_cfg.get("friendly_name","Madoka friendly name"), 
                                             self.get_device_topic(),
                                             self.controller.info)
-                self.client.publish(discovery_topic,json.dumps(vars(discovery),default=str),retain=True)
+                self.client.publish(discovery_topic, json.dumps(vars(discovery), default=str), qos=1, retain=True)
+
+    def discovery_sensors(self):
+        """Publish HA MQTT discovery for extra sensors and binary_sensors.
+
+        These cover all Madoka data fields that are NOT exposed by the main
+        climate entity, plus BT link state (connected/paired/bonded/trusted/
+        services_resolved). RSSI is included but will be null while connected.
+        All use the same state/get topic with value_template to extract their
+        field from the JSON blob.
+        """
+        if not self.client.is_connected():
+            return
+        state_topic = "/".join([self.get_device_topic(), "state", "get"])
+        uid = self.controller.connection.address.replace(":", "_")
+        friendly = self.mqtt_cfg.get("friendly_name", "Madoka")
+        device = {
+            "identifiers": [f"daikin_madoka_{self.controller.connection.address}"],
+            "name": friendly,
+            "manufacturer": "DAIKIN",
+            "model": self.controller.info.get("Model Number String", "BRC1H"),
+            "sw_version": self.controller.info.get("Software Revision String", ""),
+        }
+
+        sensors = [
+            # Extra Madoka data ------------------------------------------------
+            {
+                "type": "sensor",
+                "slug": "outdoor_temperature",
+                "name": f"{friendly} Outdoor Temperature",
+                "device_class": "temperature",
+                "unit": "°C",
+                "state_class": "measurement",
+                "value_template": "{{ value_json.temperatures['outdoor'] }}",
+            },
+            {
+                "type": "sensor",
+                "slug": "heating_set_point",
+                "name": f"{friendly} Heating Set Point",
+                "device_class": "temperature",
+                "unit": "°C",
+                "state_class": "measurement",
+                "value_template": "{{ value_json.set_point['heating_set_point'] }}",
+            },
+            {
+                "type": "sensor",
+                "slug": "heating_fan_speed",
+                "name": f"{friendly} Heating Fan Speed",
+                "icon": "mdi:fan",
+                "value_template": "{{ value_json.fan_speed['heating_fan_speed'] }}",
+            },
+            {
+                "type": "binary_sensor",
+                "slug": "clean_filter",
+                "name": f"{friendly} Clean Filter",
+                "device_class": "problem",
+                "value_template": "{{ value_json.clean_filter_indicator['clean_filter_indicator'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            # BT link state ----------------------------------------------------
+            {
+                "type": "binary_sensor",
+                "slug": "bt_connected",
+                "name": f"{friendly} BT Connected",
+                "device_class": "connectivity",
+                "value_template": "{{ value_json.bt['connected'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            {
+                "type": "binary_sensor",
+                "slug": "bt_paired",
+                "name": f"{friendly} BT Paired",
+                "device_class": "connectivity",
+                "value_template": "{{ value_json.bt['paired'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            {
+                "type": "binary_sensor",
+                "slug": "bt_bonded",
+                "name": f"{friendly} BT Bonded",
+                "device_class": "connectivity",
+                "value_template": "{{ value_json.bt['bonded'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            {
+                "type": "binary_sensor",
+                "slug": "bt_trusted",
+                "name": f"{friendly} BT Trusted",
+                "icon": "mdi:shield-check",
+                "value_template": "{{ value_json.bt['trusted'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            {
+                "type": "binary_sensor",
+                "slug": "bt_services_resolved",
+                "name": f"{friendly} BT Services Resolved",
+                "device_class": "connectivity",
+                "value_template": "{{ value_json.bt['services_resolved'] }}",
+                "payload_on": "True",
+                "payload_off": "False",
+            },
+            {
+                "type": "sensor",
+                "slug": "bt_rssi",
+                "name": f"{friendly} BT RSSI",
+                "unit": "dBm",
+                "icon": "mdi:bluetooth-audio",
+                "state_class": "measurement",
+                "value_template": "{{ value_json.bt['rssi'] }}",
+            },
+        ]
+
+        for s in sensors:
+            entity_type = s["type"]
+            slug = s["slug"]
+            config: Dict[str, Any] = {
+                "name": s["name"],
+                "unique_id": f"{uid}_{slug}",
+                "state_topic": state_topic,
+                "value_template": s["value_template"],
+                "device": device,
+                "availability": {
+                    "topic": "/".join([self.get_device_topic(), self.AVAILABLE_TOPIC]),
+                    "payload_available": "1",
+                    "payload_not_available": "0",
+                },
+            }
+            if "device_class" in s:
+                config["device_class"] = s["device_class"]
+            if "unit" in s:
+                config["unit_of_measurement"] = s["unit"]
+            if "state_class" in s:
+                config["state_class"] = s["state_class"]
+            if "icon" in s:
+                config["icon"] = s["icon"]
+            if entity_type == "binary_sensor":
+                config["payload_on"] = s.get("payload_on", "True")
+                config["payload_off"] = s.get("payload_off", "False")
+
+            topic = f"homeassistant/{entity_type}/{uid}_{slug}/config"
+            self.client.publish(topic, json.dumps(config), qos=1, retain=True)
+            logger.debug(f"Published discovery for {entity_type} {slug}")
 
     def on_message(self,client, userdata, msg):
         """ Message received callback. See paho-mqtt docs for more details. """
@@ -493,6 +655,39 @@ class MQTT:
             asyncio.get_event_loop().create_task(set_set_point_state(self.controller,msg.payload))
         
     
+async def _get_bt_state(mac: str) -> dict:
+    """Read Bluetooth link state for `mac` from BlueZ via D-Bus.
+
+    RSSI is only populated by BlueZ while the device is advertising (i.e. during
+    scanning); it is always None while a connection is established — this is a
+    BlueZ / LE protocol limitation, not a bug in this code.
+    """
+    path = "/org/bluez/hci0/dev_" + mac.upper().replace(":", "_")
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        intr = await bus.introspect("org.bluez", path)
+        obj = bus.get_proxy_object("org.bluez", path, intr)
+        dev = obj.get_interface("org.bluez.Device1")
+        state = {
+            "connected":        await dev.get_connected(),
+            "paired":           await dev.get_paired(),
+            "bonded":           await dev.get_bonded(),
+            "trusted":          await dev.get_trusted(),
+            "services_resolved": await dev.get_services_resolved(),
+            "rssi":             None,
+        }
+        try:
+            state["rssi"] = await dev.get_rssi()
+        except Exception:
+            pass
+        bus.disconnect()
+        return state
+    except Exception as e:
+        logger.warning(f"Could not read BT state from D-Bus: {e}")
+        return {"connected": None, "paired": None, "bonded": None,
+                "trusted": None, "services_resolved": None, "rssi": None}
+
+
 def coro(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -507,10 +702,10 @@ def coro(f):
 
 async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
     """ This routine is used to schedule the periodic update of the controller.
-    Args:
-        interval (int): Number of seconds to wait between updates
-        controller (`Controller`): Device controller to be updated
-        mqtt_service (`MQTT`): MQTT service to send updates with
+
+    Mirrors the upstream simple-loop model but never swallows CancelledError
+    (that's what caused the original "Operation cancelled :" silent freeze)
+    and always enriches the published status with BT link state.
     """
     reconnect = False
     while True:
@@ -522,22 +717,30 @@ async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
                 await controller.update()
                 mqtt_service.available(True)
                 status = controller.refresh_status()
-                mqtt_service.update(json.dumps(status,default=str))                
-            except CancelledError as e:
-                logger.error(f"Operation cancelled : {str(e)}")
+                # Enrich with BT link state (connected/paired/bonded/trusted/
+                # services_resolved/rssi). RSSI is null while connected — BlueZ
+                # only populates it during advertising (BLE LE limitation).
+                try:
+                    status["bt"] = await _get_bt_state(controller.connection.address)
+                except Exception as e:
+                    logger.warning(f"BT state read failed: {e}")
+                    status["bt"] = {"connected": None, "paired": None, "bonded": None,
+                                    "trusted": None, "services_resolved": None, "rssi": None}
+                mqtt_service.update(json.dumps(status, default=str))
             except ConnectionAbortedError as e:
+                logger.warning(f"BLE link aborted: {e}")
                 mqtt_service.available(False)
                 reconnect = True
             except ConnectionException as e:
+                logger.warning(f"BLE command failed: {e}")
                 mqtt_service.available(False)
                 reconnect = True
             except Exception as e:
-                logger.error(f"Exception caught : {str(e)}")
-        
+                logger.error(f"Update cycle error (continuing): {type(e).__name__}: {e}")
             await asyncio.sleep(interval)
-        
-        except CancelledError as e:
-            logger.error(f"Wait cancelled : {str(e)}")
+        except CancelledError:
+            # Supervisor is shutting us down — propagate, never swallow.
+            raise
         
 
 @click.command()
@@ -569,49 +772,113 @@ async def run(ctx,verbose,adapter,log_output,debug,address,force_disconnect, dev
         yml_config = yaml.safe_load(stream)
         ctx.obj["config"] = yml_config
     
-    logging_level = None
-    if verbose:
-        logging_level = logging.DEBUG if debug else logging.DEBUG
-        
-    logging_filename = log_output
+    # Default to INFO so the journal shows lifecycle/state lines without --verbose.
+    # --debug bumps it to DEBUG. The original code set level=None which dropped
+    # everything below WARNING, making the bridge effectively silent in journalctl.
+    if debug:
+        logging_level = logging.DEBUG
+    elif verbose:
+        logging_level = logging.INFO
+    else:
+        logging_level = logging.INFO
+
     logging.basicConfig(level=logging_level,
-                        filename = logging_filename)
+                        filename=log_output,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     
     if force_disconnect:
+        # First disconnect attempt — clears most "Connected" stale state.
         await force_device_disconnect(madoka.connection.address)
-    discovered_devices = await discover_devices(timeout = ctx.obj["timeout"], adapter = ctx.obj["adapter"])
-    mqtt_service = MQTT(asyncio.get_event_loop(),madoka,yml_config)
+
+    # Resilient BLE start: if BlueZ is in InProgress / br-connection-canceled,
+    # retry with a back-off and an extra disconnect between attempts. This is
+    # the fragile path that used to require manual `bluetoothctl disconnect`.
+    discovered_devices = []
+    for attempt in range(1, 6):
+        try:
+            discovered_devices = await discover_devices(timeout=ctx.obj["timeout"], adapter=ctx.obj["adapter"])
+            break
+        except Exception as e:
+            logger.warning(f"Device discovery attempt {attempt}/5 failed: {e}")
+            if attempt < 5:
+                await force_device_disconnect(madoka.connection.address)
+                await asyncio.sleep(2 * attempt)
+            else:
+                logger.error("Device discovery failed after 5 attempts; continuing — periodic_update will retry")
+
+    mqtt_service = MQTT(asyncio.get_event_loop(), madoka, yml_config)
     update_task = None
     try:
-        
-        await madoka.start() 
-        await madoka.read_info()      
-        connect = await mqtt_service.connect() 
-        
+        # BLE start with retry — handles `org.bluez.Error.InProgress` after a
+        # prior run left the link half-open. Up to 5 attempts with exponential
+        # back-off and a disconnect between each.
+        for attempt in range(1, 6):
+            try:
+                await madoka.start()
+                break
+            except Exception as e:
+                logger.warning(f"BLE start attempt {attempt}/5 failed: {e}")
+                if attempt < 5:
+                    await force_device_disconnect(madoka.connection.address)
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+        # read_info best-effort — missing model/sw strings shouldn't block start.
+        try:
+            await madoka.read_info()
+        except Exception as e:
+            logger.warning(f"read_info failed (continuing without device info): {e}")
+
+        connect = await mqtt_service.connect()
         if not connect:
+            logger.error("MQTT connect returned false; aborting")
             return
-        
+
+        # Publish discovery here (in async context), then yield to the loop so
+        # paho-asyncio's socket writer callback runs and the bytes actually go
+        # out before we move on. on_connect intentionally doesn't publish
+        # discovery (it can't wait for flush without blocking the loop).
         mqtt_service.discovery()
+        await asyncio.sleep(0.5)
+        mqtt_service.discovery_sensors()
+        await asyncio.sleep(1.0)
         mqtt_service.available(True)
-        
+        await asyncio.sleep(0.5)
+        logger.info("Discovery published; entering periodic update loop")
+
         update_task = asyncio.create_task(periodic_update(yml_config["daemon"]["update_interval"], madoka, mqtt_service))
-    
-        await asyncio.gather(update_task)
-    except CancelledError as e:
-        logger.error(e)
-    except ConnectionAbortedError as e:
-        if mqtt_service.connected:
-            mqtt_service.available(False)
-        if update_task is not None:
-            await update_task.stop()
-        mqtt_service.stop()
-        await madoka.stop()
-        logger.error(e)
-    except ConnectionRefusedError as e:
-        logger.error("Could not connect to MQTT broker")
+        await update_task
+
+    except CancelledError:
+        logger.info("Shutting down (cancelled).")
+        raise
+    except (ConnectionAbortedError, ConnectionRefusedError) as e:
+        logger.error(f"Aborted: {e}")
     except Exception as e:
-        logger.error(e)
+        logger.error(f"Fatal error in run(): {type(e).__name__}: {e}")
+    finally:
+        # Always signal unavailable + clean up so HA flips entities to
+        # 'unavailable' instead of showing stale state.
+        try:
+            mqtt_service.available(False)
+        except Exception:
+            pass
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
+            try:
+                await update_task
+            except (CancelledError, Exception):
+                pass
+        try:
+            mqtt_service.stop()
+        except Exception:
+            pass
+        try:
+            await madoka.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":  
