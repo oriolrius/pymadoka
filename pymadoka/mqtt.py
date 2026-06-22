@@ -263,7 +263,24 @@ class MQTT:
             self.power_command_topic = "/".join([device_topic,MQTT.POWER_STATE_TOPIC,"set"])
             self.temperature_state_topic = "/".join([device_topic,MQTT.STATE_TOPIC,"get"])
             self.temperature_command_topic = "/".join([device_topic,MQTT.SET_POINT_TOPIC,"set"])
-            
+
+            # The class-level dataclass defaults below are NOT applied because this
+            # custom __init__ overrides the dataclass-generated one, so they never
+            # land in __dict__ / vars() and were missing from the published payload.
+            # Assign them explicitly so HA receives the value templates and limits.
+            self.min_temp = 17
+            self.max_temp = 31
+            self.precision = 1
+            self.temp_step = 1
+            self.temperature_unit = "C"
+            self.temperature_command_template = "{{ value | int }}"
+            self.temperature_state_template = "{{ value_json.set_point['heating_set_point'] if value_json.operation_mode['operation_mode']=='HEAT' else value_json.set_point['cooling_set_point'] }}"
+            self.mode_state_template = "{% set values = {None:None,'off':'off','HEAT':'heat','COOL':'cool','FAN':'fan_only','AUTO':'auto','DRY':'dry'} %}{{ values[value_json.operation_mode['operation_mode']] if value_json.power_state['turn_on'] else 'off' }}"
+            self.mode_command_template = "{% set values = {'auto':'AUTO','heat':'HEAT','cool':'COOL','fan_only':'FAN','off':'OFF','dry':'DRY'} %}{{ values[value] if value in values.keys() else 'AUTO' }}"
+            self.fan_mode_state_template = "{% set values = {'AUTO':'auto','LOW':'low','MID':'medium','HIGH':'high'} %}{{ values[value_json.fan_speed['heating_fan_speed']] if value_json.operation_mode['operation_mode']=='HEAT' else values[value_json.fan_speed['cooling_fan_speed']] }}"
+            self.fan_mode_command_template = "{% set values = {'auto':'AUTO','low':'LOW','medium':'MID','high':'HIGH'} %}{{ values[value] }}"
+            self.current_temperature_template = "{{ value_json.temperatures['indoor'] }}"
+
             # These are usually set by HA, but we will enforce them
             self.unique_id = device_name
             self.name = device_friendly_name
@@ -283,15 +300,13 @@ class MQTT:
                 else ""
             )
             return {
-                "identifiers": {
-                    # Serial numbers are unique identifiers within a specific domain
-                    ("daikin_madoka", self.unique_id)
-                },
+                # A list of strings — a Python set/tuple is not JSON-serializable
+                # and previously leaked as a stringified set into the payload.
+                "identifiers": [f"daikin_madoka_{self.unique_id}"],
                 "name": self.name,
                 "manufacturer": "DAIKIN",
                 "model": model,
                 "sw_version": sw_version,
-                "via_device": ("daikin_madoka", self.unique_id),
             }
 
             
@@ -426,7 +441,7 @@ class MQTT:
         device_topic = self.get_device_topic()
         topic = "/".join([device_topic, self.AVAILABLE_TOPIC])
         
-        self.client.publish(topic,"0" if not status else "1")
+        self.client.publish(topic,"0" if not status else "1",retain=True)
 
     def update(self, status:str):
         """
@@ -461,7 +476,7 @@ class MQTT:
                                             self.mqtt_cfg.get("friendly_name","Madoka friendly name"), 
                                             self.get_device_topic(),
                                             self.controller.info)
-                self.client.publish(discovery_topic,json.dumps(vars(discovery),default=str))
+                self.client.publish(discovery_topic,json.dumps(vars(discovery),default=str),retain=True)
 
     def on_message(self,client, userdata, msg):
         """ Message received callback. See paho-mqtt docs for more details. """
@@ -582,7 +597,7 @@ async def run(ctx,verbose,adapter,log_output,debug,address,force_disconnect, dev
         
         update_task = asyncio.create_task(periodic_update(yml_config["daemon"]["update_interval"], madoka, mqtt_service))
     
-        asyncio.gather(update_task)
+        await asyncio.gather(update_task)
     except CancelledError as e:
         logger.error(e)
     except ConnectionAbortedError as e:
