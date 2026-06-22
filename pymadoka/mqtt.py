@@ -598,16 +598,11 @@ class MQTT:
                 "payload_on": "True",
                 "payload_off": "False",
             },
-            {
-                "type": "sensor",
-                "slug": "bt_rssi",
-                "name": f"{friendly} BT RSSI",
-                "unit": "dBm",
-                "icon": "mdi:bluetooth-audio",
-                "state_class": "measurement",
-                "value_template": "{{ value_json.bt['rssi'] }}",
-            },
         ]
+        # NOTE: RSSI is intentionally not published. BlueZ only exposes
+        # org.bluez.Device1.RSSI while the device is advertising; a connected
+        # LE central never gets a value, so the sensor would be permanently
+        # unknown.
 
         for s in sensors:
             entity_type = s["type"]
@@ -658,9 +653,10 @@ class MQTT:
 async def _get_bt_state(mac: str) -> dict:
     """Read Bluetooth link state for `mac` from BlueZ via D-Bus.
 
-    RSSI is only populated by BlueZ while the device is advertising (i.e. during
-    scanning); it is always None while a connection is established — this is a
-    BlueZ / LE protocol limitation, not a bug in this code.
+    Note on RSSI: BlueZ only populates `org.bluez.Device1.RSSI` while the
+    device is advertising (i.e. during scanning); it is always None for a
+    connected LE central, so we don't publish it — it would be a permanently
+    unknown sensor.
     """
     path = "/org/bluez/hci0/dev_" + mac.upper().replace(":", "_")
     try:
@@ -674,18 +670,13 @@ async def _get_bt_state(mac: str) -> dict:
             "bonded":           await dev.get_bonded(),
             "trusted":          await dev.get_trusted(),
             "services_resolved": await dev.get_services_resolved(),
-            "rssi":             None,
         }
-        try:
-            state["rssi"] = await dev.get_rssi()
-        except Exception:
-            pass
         bus.disconnect()
         return state
     except Exception as e:
         logger.warning(f"Could not read BT state from D-Bus: {e}")
         return {"connected": None, "paired": None, "bonded": None,
-                "trusted": None, "services_resolved": None, "rssi": None}
+                "trusted": None, "services_resolved": None}
 
 
 def coro(f):
