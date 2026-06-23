@@ -2,6 +2,8 @@ import asyncio
 from asyncio.exceptions import CancelledError
 from hashlib import new
 import logging
+import os
+import time
 import click
 import json
 import yaml
@@ -710,16 +712,63 @@ def coro(f):
         
     return wrapper
 
-async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
-    """ This routine is used to schedule the periodic update of the controller.
+async def _restart_bluez():
+    """Restart the system bluetooth.service via sudo (NOPASSWD rule needed).
 
-    Mirrors the upstream simple-loop model but never swallows CancelledError
-    (that's what caused the original "Operation cancelled :" silent freeze)
-    and always enriches the published status with BT link state.
+    Last-line recovery when the GATT link gets wedged: BlueZ thinks the device
+    is Connected but every command times out with "message could not be
+    rebuilt". A full bluetooth.service restart clears the kernel-side LE
+    connection state.
+
+    Requires `/etc/sudoers.d/madoka-bridge` to grant the bridge user
+    NOPASSWD on `/bin/systemctl restart bluetooth.service`.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/bin/systemctl", "restart", "bluetooth.service",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.warning("bluetooth.service restarted successfully (auto-recovery)")
+            return True
+        else:
+            logger.error(f"bluetooth.service restart failed (rc={proc.returncode}): {stderr.decode().strip()}")
+            return False
+    except Exception as e:
+        logger.error(f"bluetooth.service restart exception: {e}")
+        return False
+
+
+# Watchdog thresholds. Set via env vars MADOKA_BT_RESTART_AFTER /
+# MADOKA_EXIT_AFTER_S so they can be tuned per deployment without code change.
+_BT_RESTART_AFTER = int(os.environ.get("MADOKA_BT_RESTART_AFTER", "5"))
+_EXIT_AFTER_S = int(os.environ.get("MADOKA_EXIT_AFTER_S", "300"))
+
+
+async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
+    """Schedule the periodic update of the controller, with watchdog recovery.
+
+    Resilience layers (in escalation order):
+      1) Single-cycle BLE error → mark unavailable, force BLE reconnect next
+         cycle. Most transient hiccups recover here.
+      2) `MADOKA_BT_RESTART_AFTER` consecutive failures (~2.5 min @ 30s) →
+         `sudo systemctl restart bluetooth.service`. Catches the wedged-GATT
+         state where BlueZ says Connected but every command times out.
+      3) No successful publish for `MADOKA_EXIT_AFTER_S` seconds (default
+         5 min) → process exits with status 1. systemd `Restart=always`
+         brings the whole bridge back, including a fresh BlueZ socket.
+
+    Never swallows CancelledError (that's what caused the original
+    "Operation cancelled :" silent freeze).
     """
     reconnect = False
+    consecutive_failures = 0
+    last_success = time.monotonic()
     while True:
         try:
+            failed_this_cycle = False
             try:
                 if reconnect:
                     await controller.start()
@@ -728,28 +777,62 @@ async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
                 mqtt_service.available(True)
                 status = controller.refresh_status()
                 # Enrich with BT link state (connected/paired/bonded/trusted/
-                # services_resolved/rssi). RSSI is null while connected — BlueZ
-                # only populates it during advertising (BLE LE limitation).
+                # services_resolved). RSSI intentionally not published — BlueZ
+                # doesn't expose it for connected LE links.
                 try:
                     status["bt"] = await _get_bt_state(controller.connection.address)
                 except Exception as e:
                     logger.warning(f"BT state read failed: {e}")
                     status["bt"] = {"connected": None, "paired": None, "bonded": None,
-                                    "trusted": None, "services_resolved": None, "rssi": None}
+                                    "trusted": None, "services_resolved": None}
                 mqtt_service.update(json.dumps(status, default=str))
+                # Success — reset watchdog state.
+                consecutive_failures = 0
+                last_success = time.monotonic()
             except ConnectionAbortedError as e:
                 logger.warning(f"BLE link aborted: {e}")
                 mqtt_service.available(False)
                 reconnect = True
+                failed_this_cycle = True
             except ConnectionException as e:
                 logger.warning(f"BLE command failed: {e}")
                 mqtt_service.available(False)
                 reconnect = True
+                failed_this_cycle = True
             except Exception as e:
                 logger.error(f"Update cycle error (continuing): {type(e).__name__}: {e}")
+                failed_this_cycle = True
+
+            if failed_this_cycle:
+                consecutive_failures += 1
+                # Layer 2: try a BlueZ restart after N consecutive failures.
+                # Only attempt ONCE per failure streak — if it doesn't help,
+                # the layer-3 timeout will kick in and exit the process.
+                if consecutive_failures == _BT_RESTART_AFTER:
+                    logger.warning(
+                        f"{consecutive_failures} consecutive BLE failures — "
+                        f"restarting bluetooth.service (auto-recovery)"
+                    )
+                    if await _restart_bluez():
+                        # Give BlueZ a few seconds to come back up before the
+                        # next BLE start attempt.
+                        await asyncio.sleep(5)
+
+                # Layer 3: if no publish has succeeded for too long, exit.
+                # systemd Restart=always will bring us back with a clean slate.
+                elapsed = time.monotonic() - last_success
+                if elapsed > _EXIT_AFTER_S:
+                    logger.error(
+                        f"No successful publish for {int(elapsed)} s "
+                        f"(threshold {_EXIT_AFTER_S} s) — exiting so systemd "
+                        f"restarts the bridge."
+                    )
+                    raise SystemExit(1)
+
             await asyncio.sleep(interval)
-        except CancelledError:
-            # Supervisor is shutting us down — propagate, never swallow.
+        except (CancelledError, SystemExit):
+            # Supervisor is shutting us down or we're escalating exit — never
+            # swallow these.
             raise
         
 
