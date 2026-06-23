@@ -7,6 +7,7 @@ import time
 import click
 import json
 import yaml
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 from paho.mqtt import MQTTException
@@ -737,6 +738,159 @@ def coro(f):
         
     return wrapper
 
+# ---------------------------------------------------------------------------
+# Layer-4 watchdog: persistent restart-spiral circuit breaker → sudo reboot.
+#
+# Lower layers (per-cycle reconnect, sudo systemctl restart bluetooth.service,
+# os._exit(1) on prolonged silence) all run inside the process. None of them
+# survive a Madoka GATT lock-up at the device side — only an OS reboot has
+# fixed that in production. Layer 4 detects "we've been restarting in a tight
+# loop without ever succeeding" and triggers a system reboot — but only if we
+# haven't already rebooted recently (the circuit breaker), to avoid a boot
+# loop when the AC unit itself needs a physical power cycle.
+#
+# The watchdog state MUST persist across reboots; that's exactly what makes
+# the circuit breaker count work. Lives at MADOKA_STATE_FILE (default
+# ~/.local/state/madoka-bridge/state.json, mode 600).
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STATE_PATH = os.environ.get(
+    "MADOKA_STATE_FILE",
+    str(Path.home() / ".local" / "state" / "madoka-bridge" / "state.json"),
+)
+_REBOOT_AFTER_FAILED_STARTS = int(os.environ.get("MADOKA_REBOOT_AFTER_FAILED_STARTS", "5"))
+_REBOOT_WINDOW_S = int(os.environ.get("MADOKA_REBOOT_WINDOW_S", "1800"))
+_MAX_REBOOTS_PER_DAY = int(os.environ.get("MADOKA_MAX_REBOOTS_PER_DAY", "2"))
+
+
+class _BridgeState:
+    """Persistent watchdog state.
+
+    Tracks:
+      - process_starts: timestamps of every bridge startup in the last hour.
+        The runaway-loop detector counts these against
+        _REBOOT_AFTER_FAILED_STARTS within _REBOOT_WINDOW_S.
+      - reboot_history: timestamps of every reboot the watchdog has triggered
+        in the last 48 h. The circuit breaker caps these at
+        _MAX_REBOOTS_PER_DAY.
+
+    All timestamps are unix-epoch seconds (`time.time()`, NOT monotonic —
+    monotonic resets at reboot).
+    """
+
+    def __init__(self, path: str = _DEFAULT_STATE_PATH):
+        self.path = path
+        self.process_starts = []
+        self.reboot_history = []
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r") as f:
+                data = json.load(f)
+            self.process_starts = [float(t) for t in data.get("process_starts", [])]
+            self.reboot_history = [float(t) for t in data.get("reboot_history", [])]
+        except FileNotFoundError:
+            pass  # first run, expected
+        except Exception as e:
+            logger.warning(f"watchdog state file unreadable, starting fresh: {e}")
+            self.process_starts = []
+            self.reboot_history = []
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "process_starts": self.process_starts,
+                    "reboot_history": self.reboot_history,
+                }, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            logger.warning(f"watchdog state file unwritable: {e}")
+
+    def register_start(self, now: float):
+        self.process_starts.append(now)
+        # Rotate: keep last 1 h of starts, last 48 h of reboots.
+        self.process_starts = [t for t in self.process_starts if t > now - 3600]
+        self.reboot_history = [t for t in self.reboot_history if t > now - 48 * 3600]
+        self._save()
+
+    def register_reboot(self, now: float):
+        self.reboot_history.append(now)
+        self._save()
+
+    def starts_in_last(self, seconds: float, now: float) -> int:
+        cutoff = now - seconds
+        return sum(1 for t in self.process_starts if t > cutoff)
+
+    def reboots_in_last(self, seconds: float, now: float) -> int:
+        cutoff = now - seconds
+        return sum(1 for t in self.reboot_history if t > cutoff)
+
+
+async def _do_reboot() -> bool:
+    """Trigger a system reboot via `sudo /sbin/reboot`.
+
+    Requires a sudoers rule:
+        oriol ALL=(root) NOPASSWD: /sbin/reboot
+    """
+    logger.error("Triggering system reboot (watchdog layer 4)")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/sbin/reboot",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"reboot failed (rc={proc.returncode}): {stderr.decode().strip()}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"reboot exception: {e}")
+        return False
+
+
+def _layer4_decide(state: _BridgeState, now: float) -> str:
+    """Decide what to do at process start based on the persisted history.
+
+    Returns one of:
+      "normal"   — no spiral detected; just start the bridge as usual.
+      "reboot"   — restart-spiral confirmed and the circuit breaker is still
+                   open: trigger a system reboot.
+      "degraded" — restart-spiral confirmed but we've already rebooted
+                   `_MAX_REBOOTS_PER_DAY` times today; the problem is almost
+                   certainly the AC unit needing a physical power cycle, so
+                   we keep the bridge running (which will keep retrying) but
+                   loudly log so a human notices.
+    """
+    starts = state.starts_in_last(_REBOOT_WINDOW_S, now)
+    if starts < _REBOOT_AFTER_FAILED_STARTS:
+        return "normal"
+
+    reboots_24h = state.reboots_in_last(86400, now)
+    if reboots_24h >= _MAX_REBOOTS_PER_DAY:
+        logger.error(
+            f"DEGRADED MODE: {starts} starts in last {_REBOOT_WINDOW_S}s "
+            f"(threshold {_REBOOT_AFTER_FAILED_STARTS}); already rebooted "
+            f"{reboots_24h} times in last 24h (max {_MAX_REBOOTS_PER_DAY}). "
+            f"Not rebooting again — needs human intervention "
+            f"(likely AC unit power cycle)."
+        )
+        return "degraded"
+
+    logger.error(
+        f"LAYER 4 TRIGGERED: {starts} starts in last {_REBOOT_WINDOW_S}s "
+        f"(threshold {_REBOOT_AFTER_FAILED_STARTS}); "
+        f"{reboots_24h} reboots in last 24h — system in restart spiral, "
+        f"triggering reboot."
+    )
+    return "reboot"
+
+
 async def _restart_bluez():
     """Restart the system bluetooth.service via sudo (NOPASSWD rule needed).
 
@@ -782,8 +936,13 @@ async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
          `sudo systemctl restart bluetooth.service`. Catches the wedged-GATT
          state where BlueZ says Connected but every command times out.
       3) No successful publish for `MADOKA_EXIT_AFTER_S` seconds (default
-         5 min) → process exits with status 1. systemd `Restart=always`
+         5 min) → hard-exit via `os._exit(1)`. systemd `Restart=always`
          brings the whole bridge back, including a fresh BlueZ socket.
+      4) (in run(), not here) The circuit-breaker watchdog: if we land here
+         after `_REBOOT_AFTER_FAILED_STARTS` rapid starts in
+         `_REBOOT_WINDOW_S`, the system gets rebooted. Capped at
+         `_MAX_REBOOTS_PER_DAY` so a stuck AC unit doesn't trigger a boot
+         loop. See `_layer4_decide()`.
 
     Never swallows CancelledError (that's what caused the original
     "Operation cancelled :" silent freeze).
@@ -919,7 +1078,27 @@ async def run(ctx,verbose,adapter,log_output,debug,address,force_disconnect, dev
                         filename=log_output,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    
+    # ---- Layer-4 watchdog: restart-spiral circuit breaker ----
+    # MUST run BEFORE any BLE/MQTT work so a runaway-loop reboot doesn't
+    # incur 30+ s of doomed connection attempts on each spin. The state file
+    # is persistent so the count survives reboots — that's the whole point.
+    _watchdog_state = _BridgeState()
+    _watchdog_now = time.time()
+    _watchdog_state.register_start(_watchdog_now)
+    _decision = _layer4_decide(_watchdog_state, _watchdog_now)
+    if _decision == "reboot":
+        _watchdog_state.register_reboot(_watchdog_now)
+        await _do_reboot()
+        # If reboot succeeded the kernel will SIGTERM us shortly. Wait a bit
+        # to give it room, then hard-exit so systemd doesn't bring us back up
+        # before reboot kicks in. If reboot failed (sudoers missing etc.),
+        # os._exit(1) still gets us out of this start cycle cleanly.
+        await asyncio.sleep(30)
+        os._exit(1)
+    # "degraded" falls through to a normal start — the bridge keeps trying,
+    # it just won't reboot again. The loud ERROR log in _layer4_decide()
+    # makes the state observable.
+
     if force_disconnect:
         # First disconnect attempt — clears most "Connected" stale state.
         await force_device_disconnect(madoka.connection.address)

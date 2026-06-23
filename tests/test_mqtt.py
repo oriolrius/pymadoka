@@ -190,3 +190,107 @@ async def test_set_operation_mode_off_only_powers_off():
     await set_operation_mode(controller, b"OFF")
     controller.operation_mode.update.assert_not_awaited()
     assert controller.power_state.update.await_args.args[0].turn_on is False
+
+
+# ---------------------------------------------------------------------------
+# Layer-4 watchdog (persistent restart-spiral circuit breaker)
+# ---------------------------------------------------------------------------
+
+from pymadoka.mqtt import _BridgeState, _layer4_decide
+
+
+def test_bridge_state_first_run_is_empty(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    assert s.process_starts == []
+    assert s.reboot_history == []
+
+
+def test_bridge_state_register_start_persists(tmp_path):
+    p = str(tmp_path / "state.json")
+    s = _BridgeState(p)
+    s.register_start(1000.0)
+    s2 = _BridgeState(p)
+    assert s2.process_starts == [1000.0]
+
+
+def test_bridge_state_rotates_old_starts(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    s.process_starts = [100.0, 200.0, 300.0]  # all "old"
+    # Now is 2 hours later — all should be rotated out (>1h window).
+    s.register_start(now=300.0 + 7200)
+    assert s.process_starts == [300.0 + 7200]
+
+
+def test_bridge_state_keeps_recent_starts(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    # Three recent starts within the last hour, plus one old one.
+    now = 10000.0
+    s.process_starts = [now - 3700, now - 30, now - 10]  # 1 old + 2 recent
+    s.register_start(now)
+    assert sorted(s.process_starts) == [now - 30, now - 10, now]
+
+
+def test_bridge_state_rotates_old_reboots(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    s.reboot_history = [100.0]  # 49 h old
+    # register_start rotates BOTH lists.
+    s.register_start(now=100.0 + 49 * 3600)
+    assert s.reboot_history == []
+
+
+def test_bridge_state_corrupt_file_is_safe(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text("not json {{{")
+    s = _BridgeState(str(p))
+    # Corrupt file → empty state, no crash.
+    assert s.process_starts == []
+    assert s.reboot_history == []
+
+
+def test_bridge_state_counts_in_window():
+    s = _BridgeState.__new__(_BridgeState)  # bypass _load
+    s.process_starts = [100.0, 200.0, 300.0, 400.0, 500.0]
+    s.reboot_history = []
+    # Window from 250 to 600: starts at 300,400,500 → 3.
+    assert s.starts_in_last(600 - 250, 600) == 3
+    # Full history: 5.
+    assert s.starts_in_last(10000, 600) == 5
+
+
+def test_layer4_normal_below_threshold(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    # 4 starts in the last 30 min — under default threshold of 5.
+    now = 100000.0
+    for t in (now - 600, now - 500, now - 200, now - 50):
+        s.process_starts.append(t)
+    assert _layer4_decide(s, now) == "normal"
+
+
+def test_layer4_reboot_when_spiral_and_breaker_open(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    now = 100000.0
+    # 5 starts in last 30 min → trigger.
+    for t in (now - 1500, now - 1000, now - 500, now - 200, now - 30):
+        s.process_starts.append(t)
+    # No reboots in last 24 h → breaker open → reboot.
+    assert _layer4_decide(s, now) == "reboot"
+
+
+def test_layer4_degraded_when_breaker_tripped(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    now = 100000.0
+    for t in (now - 1500, now - 1000, now - 500, now - 200, now - 30):
+        s.process_starts.append(t)
+    # 2 reboots in last 24 h → at the default cap → no more reboots.
+    s.reboot_history = [now - 7200, now - 3600]
+    assert _layer4_decide(s, now) == "degraded"
+
+
+def test_layer4_rotated_old_reboots_dont_block(tmp_path):
+    s = _BridgeState(str(tmp_path / "state.json"))
+    now = 100000.0
+    for t in (now - 1500, now - 1000, now - 500, now - 200, now - 30):
+        s.process_starts.append(t)
+    # 2 reboots, both >24 h ago → don't count → breaker open → reboot.
+    s.reboot_history = [now - 25 * 3600, now - 30 * 3600]
+    assert _layer4_decide(s, now) == "reboot"
