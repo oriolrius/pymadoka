@@ -91,13 +91,36 @@ class AsyncioHelper:
                 break
 
 
-async def set_operation_mode(controller:Controller,payload:str):
+async def _publish_state_now(controller, mqtt_service):
+    """Publish the current cached controller status to MQTT immediately.
+
+    Used right after a successful command write so HA sees the change without
+    waiting for the next periodic_update cycle (which is interval seconds away,
+    up to ~30 s with the default config). Cheap: no BLE round-trip — feature
+    .update() already wrote the new value into `self.status` on success, so
+    refresh_status() reflects it. BT state is best-effort.
     """
-    Callback used to set the operation mode. It will issue a turn on/off command 
-    depending on the value of the mode (OFF if 'OFF', ON otherwise)
-    Args:
-        controller (`Controller`): Device controller
-        payload (str): The payload will be converted to the values accepted by the controller
+    if mqtt_service is None:
+        return
+    try:
+        status = controller.refresh_status()
+        try:
+            status["bt"] = await _get_bt_state(controller.connection.address)
+        except Exception:
+            status["bt"] = {"connected": None, "paired": None, "bonded": None,
+                            "trusted": None, "services_resolved": None}
+        mqtt_service.update(json.dumps(status, default=str))
+    except Exception as e:
+        logger.warning(f"immediate publish after write failed: {e}")
+
+
+async def set_operation_mode(controller:Controller, payload, mqtt_service=None):
+    """
+    Callback used to set the operation mode. It will issue a turn on/off command
+    depending on the value of the mode (OFF if 'OFF', ON otherwise).
+
+    On success, publishes the new state immediately so HA UI updates without
+    waiting for the next periodic poll.
     """
     try:
         value = payload.decode("utf-8").upper()
@@ -105,25 +128,21 @@ async def set_operation_mode(controller:Controller,payload:str):
             status = OperationModeStatus(OperationModeEnum[value])
             await controller.operation_mode.update(status)
         await controller.power_state.update(PowerStateStatus(value != "OFF"))
-    except CancelledError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionException as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionAbortedError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        await _publish_state_now(controller, mqtt_service)
+    except (CancelledError, ConnectionException, ConnectionAbortedError) as e:
+        logger.error(f"Could not update operation mode: {type(e).__name__}: {e}")
     except Exception as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    
-async def set_fan_speed(controller:Controller,payload:str):
-    """
-    Callback used to set the fan speed
-    Args:
-        controller (`Controller`): Device controller
-        payload (str): The payload will be converted to the values accepted by the controller
-    """
+        logger.error(f"Could not update operation mode: {e}")
 
+
+async def set_fan_speed(controller:Controller, payload, mqtt_service=None):
+    """
+    Callback used to set the fan speed.
+
+    On success, publishes the new state immediately so HA UI updates without
+    waiting for the next periodic poll.
+    """
     try:
-
         value = payload.decode("utf-8").upper()
         # .cooling_fan_speed / .heating_fan_speed are FanSpeedEnum members, not
         # strings — FanSpeedEnum[enum_member] raises KeyError, so extract .name.
@@ -142,40 +161,36 @@ async def set_fan_speed(controller:Controller,payload:str):
         status = FanSpeedStatus(FanSpeedEnum[new_cooling_fan_speed],
                                 FanSpeedEnum[new_heating_fan_speed])
         await controller.fan_speed.update(status)
-    except CancelledError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionException as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionAbortedError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        await _publish_state_now(controller, mqtt_service)
+    except (CancelledError, ConnectionException, ConnectionAbortedError) as e:
+        logger.error(f"Could not update fan speed: {type(e).__name__}: {e}")
     except Exception as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        logger.error(f"Could not update fan speed: {e}")
 
-async def set_power_state(controller:Controller,payload:str):
+
+async def set_power_state(controller:Controller, payload, mqtt_service=None):
     """
-    Callback used to set the power state
-    Args:
-        controller (`Controller`): Device controller
-        payload (str): The payload will be converted to the values accepted by the controller
+    Callback used to set the power state.
+
+    On success, publishes the new state immediately so HA UI updates without
+    waiting for the next periodic poll.
     """
     try:
         status = PowerStateStatus(payload.decode("utf-8").upper()=="ON")
         await controller.power_state.update(status)
-    except CancelledError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionException as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionAbortedError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        await _publish_state_now(controller, mqtt_service)
+    except (CancelledError, ConnectionException, ConnectionAbortedError) as e:
+        logger.error(f"Could not update power state: {type(e).__name__}: {e}")
     except Exception as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        logger.error(f"Could not update power state: {e}")
 
-async def set_set_point_state(controller:Controller,payload:str):
+
+async def set_set_point_state(controller:Controller, payload, mqtt_service=None):
     """
-    Callback used to set the set point (target temperature)
-    Args:
-        controller (`Controller`): Device controller
-        payload (str): The payload will be converted to the values accepted by the controller
+    Callback used to set the set point (target temperature).
+
+    On success, publishes the new state immediately so HA UI updates without
+    waiting for the next periodic poll.
     """
     try:
         value = int(payload.decode("utf-8"))
@@ -186,20 +201,17 @@ async def set_set_point_state(controller:Controller,payload:str):
            controller.operation_mode.status.operation_mode == OperationModeEnum.DRY or
            controller.operation_mode.status.operation_mode == OperationModeEnum.FAN):
             new_cooling_set_point = value
-            new_heating_set_point = value 
+            new_heating_set_point = value
         elif controller.operation_mode.status.operation_mode == OperationModeEnum.HEAT:
             new_heating_set_point = value
         elif controller.operation_mode.status.operation_mode == OperationModeEnum.COOL:
             new_cooling_set_point = value
         await controller.set_point.update(SetPointStatus(new_cooling_set_point,new_heating_set_point))
-    except CancelledError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionException as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
-    except ConnectionAbortedError as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        await _publish_state_now(controller, mqtt_service)
+    except (CancelledError, ConnectionException, ConnectionAbortedError) as e:
+        logger.error(f"Could not update set point: {type(e).__name__}: {e}")
     except Exception as e:
-        logging.error(f"Could not update operation mode: {str(e)}")
+        logger.error(f"Could not update set point: {e}")
 
 class MQTT:
 
@@ -636,18 +648,25 @@ class MQTT:
             logger.debug(f"Published discovery for {entity_type} {slug}")
 
     def on_message(self,client, userdata, msg):
-        """ Message received callback. See paho-mqtt docs for more details. """
+        """ Message received callback. See paho-mqtt docs for more details.
+
+        Each set_* handler publishes the new state immediately after the BLE
+        write succeeds (see _publish_state_now), so HA UI updates within the
+        BLE round-trip (~1-3 s) rather than after the next periodic poll
+        (up to ~30 s).
+        """
+        loop = asyncio.get_event_loop()
         if msg.topic == "/".join([self.get_device_topic(), self.OPERATION_MODE_TOPIC,"set"]):
-            asyncio.get_event_loop().create_task(set_operation_mode(self.controller,msg.payload))
-        
+            loop.create_task(set_operation_mode(self.controller, msg.payload, mqtt_service=self))
+
         elif msg.topic == "/".join([self.get_device_topic(), self.FAN_SPEED_TOPIC,"set"]):
-            asyncio.get_event_loop().create_task(set_fan_speed(self.controller,msg.payload))
-        
+            loop.create_task(set_fan_speed(self.controller, msg.payload, mqtt_service=self))
+
         elif msg.topic == "/".join([self.get_device_topic(), self.POWER_STATE_TOPIC,"set"]):
-            asyncio.get_event_loop().create_task(set_power_state(self.controller,msg.payload))
-        
+            loop.create_task(set_power_state(self.controller, msg.payload, mqtt_service=self))
+
         elif msg.topic == "/".join([self.get_device_topic(), self.SET_POINT_TOPIC,"set"]):
-            asyncio.get_event_loop().create_task(set_set_point_state(self.controller,msg.payload))
+            loop.create_task(set_set_point_state(self.controller, msg.payload, mqtt_service=self))
         
     
 async def _get_bt_state(mac: str) -> dict:
