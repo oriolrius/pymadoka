@@ -146,18 +146,30 @@ async def set_fan_speed(controller:Controller, payload, mqtt_service=None):
     """
     try:
         value = payload.decode("utf-8").upper()
-        # .cooling_fan_speed / .heating_fan_speed are FanSpeedEnum members, not
-        # strings — FanSpeedEnum[enum_member] raises KeyError, so extract .name.
-        new_cooling_fan_speed = controller.fan_speed.status.cooling_fan_speed.name
-        new_heating_fan_speed = controller.fan_speed.status.heating_fan_speed.name
-        if (controller.operation_mode.status.operation_mode == OperationModeEnum.AUTO or
-           controller.operation_mode.status.operation_mode == OperationModeEnum.DRY or
-           controller.operation_mode.status.operation_mode == OperationModeEnum.FAN):
+        # If the periodic update loop hasn't completed a successful query yet,
+        # .status is None — fall back to AUTO/AUTO as a safe baseline rather
+        # than crashing with 'NoneType has no attribute cooling_fan_speed'.
+        if controller.fan_speed.status is None:
+            new_cooling_fan_speed = "AUTO"
+            new_heating_fan_speed = "AUTO"
+        else:
+            # .cooling_fan_speed / .heating_fan_speed are FanSpeedEnum members,
+            # not strings — FanSpeedEnum[enum_member] raises KeyError, so
+            # extract .name.
+            new_cooling_fan_speed = controller.fan_speed.status.cooling_fan_speed.name
+            new_heating_fan_speed = controller.fan_speed.status.heating_fan_speed.name
+        # operation_mode.status can also be None before the first poll — if so,
+        # apply the change to both cooling and heating side as the safest
+        # default (covers AUTO/DRY/FAN behaviour).
+        op_mode = (controller.operation_mode.status.operation_mode
+                   if controller.operation_mode.status is not None else None)
+        if op_mode in (OperationModeEnum.AUTO, OperationModeEnum.DRY,
+                       OperationModeEnum.FAN, None):
             new_cooling_fan_speed = value
             new_heating_fan_speed = value
-        elif controller.operation_mode.status.operation_mode == OperationModeEnum.HEAT:
+        elif op_mode == OperationModeEnum.HEAT:
             new_heating_fan_speed = value
-        elif controller.operation_mode.status.operation_mode == OperationModeEnum.COOL:
+        elif op_mode == OperationModeEnum.COOL:
             new_cooling_fan_speed = value
 
         status = FanSpeedStatus(FanSpeedEnum[new_cooling_fan_speed],
@@ -196,17 +208,26 @@ async def set_set_point_state(controller:Controller, payload, mqtt_service=None)
     """
     try:
         value = int(payload.decode("utf-8"))
-        new_cooling_set_point = controller.set_point.status.cooling_set_point
-        new_heating_set_point = controller.set_point.status.heating_set_point
-
-        if (controller.operation_mode.status.operation_mode == OperationModeEnum.AUTO or
-           controller.operation_mode.status.operation_mode == OperationModeEnum.DRY or
-           controller.operation_mode.status.operation_mode == OperationModeEnum.FAN):
+        # If the periodic update loop hasn't completed a successful query yet,
+        # .status is None — seed both points with the requested value rather
+        # than crashing with 'NoneType has no attribute cooling_set_point'.
+        if controller.set_point.status is None:
             new_cooling_set_point = value
             new_heating_set_point = value
-        elif controller.operation_mode.status.operation_mode == OperationModeEnum.HEAT:
+        else:
+            new_cooling_set_point = controller.set_point.status.cooling_set_point
+            new_heating_set_point = controller.set_point.status.heating_set_point
+
+        # operation_mode.status may be None before the first successful poll.
+        op_mode = (controller.operation_mode.status.operation_mode
+                   if controller.operation_mode.status is not None else None)
+        if op_mode in (OperationModeEnum.AUTO, OperationModeEnum.DRY,
+                       OperationModeEnum.FAN, None):
+            new_cooling_set_point = value
             new_heating_set_point = value
-        elif controller.operation_mode.status.operation_mode == OperationModeEnum.COOL:
+        elif op_mode == OperationModeEnum.HEAT:
+            new_heating_set_point = value
+        elif op_mode == OperationModeEnum.COOL:
             new_cooling_set_point = value
         await controller.set_point.update(SetPointStatus(new_cooling_set_point,new_heating_set_point))
         await _publish_state_now(controller, mqtt_service)
@@ -268,7 +289,11 @@ class MQTT:
 
         def __init__(self,device_name: str, device_friendly_name: str, device_topic: str, dev_info: Dict[str, Any]):
             self.modes = ["auto","off","cool","heat","dry","fan_only"]
-            self.fan_modes = ["low","medium","high"]
+            # 'auto' added to match what the Madoka itself exposes — the BLE
+            # FanSpeedEnum has AUTO and the unit accepts it; the existing
+            # state/command templates already map AUTO ↔ auto. Without 'auto'
+            # in this list, HA hides the option in the climate card.
+            self.fan_modes = ["auto","low","medium","high"]
             self.availability = {"payload_available": 1,
                                 "payload_not_available": 0,
                                 "topic": device_topic + "/available"
@@ -818,21 +843,36 @@ async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
                         # next BLE start attempt.
                         await asyncio.sleep(5)
 
-                # Layer 3: if no publish has succeeded for too long, exit.
-                # systemd Restart=always will bring us back with a clean slate.
+                # Layer 3: if no publish has succeeded for too long, hard-exit.
+                # systemd Restart=always brings us back with a clean slate.
+                #
+                # We use os._exit(1) instead of sys.exit / raise SystemExit:
+                # both of those go through the normal exception machinery and
+                # get caught by the run()/coro try/finally blocks, leaving the
+                # process alive but stuck (the bleak cleanup raises
+                # 'NoneType has no attribute schedule_write' which the broad
+                # except eats, then the loop is done but the process never
+                # actually exits). os._exit() is the OS-level abort: no
+                # cleanup, no asyncio shutdown, no chance to deadlock —
+                # exactly what we want from a watchdog of last resort.
                 elapsed = time.monotonic() - last_success
                 if elapsed > _EXIT_AFTER_S:
                     logger.error(
                         f"No successful publish for {int(elapsed)} s "
-                        f"(threshold {_EXIT_AFTER_S} s) — exiting so systemd "
-                        f"restarts the bridge."
+                        f"(threshold {_EXIT_AFTER_S} s) — hard-exiting so "
+                        f"systemd restarts the bridge."
                     )
-                    raise SystemExit(1)
+                    # Best-effort: tell HA we're offline before vanishing.
+                    try:
+                        mqtt_service.available(False)
+                    except Exception:
+                        pass
+                    os._exit(1)
 
             await asyncio.sleep(interval)
-        except (CancelledError, SystemExit):
-            # Supervisor is shutting us down or we're escalating exit — never
-            # swallow these.
+        except CancelledError:
+            # Supervisor is shutting us down — propagate, never swallow.
+            # Layer-3 exit goes via os._exit() above; we never raise SystemExit.
             raise
         
 
