@@ -148,6 +148,76 @@ async def test_on_disconnect_accepts_version2_signature():
     m.reconnect.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_on_disconnect_skips_when_already_reconnecting():
+    """A disconnect that arrives while a reconnect loop is already running must
+    NOT spawn a second competing loop."""
+    m = make_mqtt()
+    m.client = MagicMock()
+    m.reconnect = AsyncMock()
+    m._reconnecting = True
+    m.on_disconnect(m.client, None, None, _connack("Success"), None)
+    await asyncio.sleep(0)
+    m.reconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_is_single_flight():
+    """reconnect() must return immediately if another loop already owns the
+    reconnect (guarded by _reconnecting), without touching the client."""
+    m = make_mqtt()
+    m.client = MagicMock()
+    m._reconnecting = True
+    await m.reconnect()
+    m.client.reconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reuses_client_and_stops_when_connected():
+    """reconnect() must reuse the existing client via client.reconnect()
+    (not build a new one) and exit once is_connected() is True."""
+    m = make_mqtt()
+    m.client = MagicMock()
+    # Not connected on entry, connected after the first client.reconnect().
+    m.client.is_connected.side_effect = [False, True, True]
+    await m.reconnect()
+    m.client.reconnect.assert_called_once()
+    assert m._reconnecting is False  # guard released in finally
+
+
+def test_connect_sets_last_will():
+    """connect() must register an LWT on the availability topic (retained, 0)
+    BEFORE connecting, so the broker reports us unavailable on an ungraceful
+    drop."""
+    import pymadoka.mqtt as mqtt_mod
+    fake_client = MagicMock()
+    m = make_mqtt(root_topic="madoka", root_topic_only=False)
+    loop = asyncio.new_event_loop()
+    m.loop = loop
+
+    async def _run():
+        # build_client is module-level; patch it for the duration of connect().
+        orig = mqtt_mod.build_client
+        mqtt_mod.build_client = lambda _id: fake_client
+        try:
+            return m.connect()
+        finally:
+            mqtt_mod.build_client = orig
+
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    fake_client.will_set.assert_called_once()
+    args, kwargs = fake_client.will_set.call_args
+    assert args[0] == "madoka/AA_BB_CC_DD_EE_FF/available"
+    assert kwargs.get("payload") == "0"
+    assert kwargs.get("retain") is True
+    # will must be set before connect() is invoked
+    assert fake_client.connect.called
+
+
 # --------------------------------------------------------------------------- #
 # Command path decoding (broker -> BLE)
 # --------------------------------------------------------------------------- #

@@ -371,11 +371,15 @@ class MQTT:
         self.client:mqtt.Client = None
         self.mqtt_cfg = config["mqtt"]
         self.loop = loop
+        # Single-flight guard for reconnect(): repeated on_disconnect callbacks
+        # must not spawn several competing reconnect loops.
+        self._reconnecting:bool = False
         
 
     def connect(self):
-        """ Connect to the MQTT broker. It returns a future to notify when the 
-        connection has been finished.
+        """ Connect to the MQTT broker. Returns a future resolved True/False once
+        the CONNACK arrives (or the initial connect fails) — always awaitable,
+        never None.
         """
 
         id = "madoka_mqtt_" + self.controller.connection.address
@@ -386,7 +390,7 @@ class MQTT:
         self.client:mqtt.Client = build_client(id)
         if "username" in self.mqtt_cfg:
             self.client.username_pw_set(username=self.mqtt_cfg["username"],password=self.mqtt_cfg["password"])
-       
+
         if self.mqtt_cfg["ssl"]:
             # Use the system CA store and a modern TLS version. The previous code
             # referenced a non-existent ``mqtt.TLS_CERT_PATH`` which raised
@@ -394,20 +398,37 @@ class MQTT:
             self.client.tls_set(cert_reqs=mqtt.ssl.CERT_REQUIRED,
                                 tls_version=mqtt.ssl.PROTOCOL_TLS_CLIENT)
             self.client.tls_insecure_set(False)
-        
+
+        # Last Will & Testament: if the bridge falls off the broker ungracefully
+        # (power loss, Wi-Fi drop, OOM, kill -9) the broker publishes
+        # available=0 on our behalf, so HA flips the entities to 'unavailable'
+        # within ~1.5x keepalive instead of showing stale state forever.
+        # Retained so a late-subscribing HA also picks it up. The normal paths
+        # still publish availability explicitly; the will only covers the cases
+        # where we never get the chance to.
+        avail_topic = "/".join([self.get_device_topic(), self.AVAILABLE_TOPIC])
+        self.client.will_set(avail_topic, payload="0", qos=1, retain=True)
+
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+
+        # Create the future BEFORE connect() so on_connect (which can fire as
+        # soon as the loop turns) always finds it, and so a failed connect can
+        # resolve it to False rather than returning None (await None → TypeError
+        # in the old reconnect loop).
+        self.connect_future = asyncio.get_event_loop().create_future()
         try:
-
-            aioh = AsyncioHelper(self.loop, self.client)
-         
-            self.client.on_connect = self.on_connect
-            self.client.on_message = self.on_message
-            self.client.on_disconnect = self.on_disconnect
-            self.client.connect(self.mqtt_cfg["host"], port=self.mqtt_cfg["port"])
-            self.connect_future = asyncio.get_event_loop().create_future()
-            return self.connect_future
-
-        except MQTTException as e:
-            logger.error(f"Error in MQTT: {str(e)}")
+            AsyncioHelper(self.loop, self.client)
+            # keepalive drives how fast the broker detects a dead client and
+            # fires the LWT above.
+            self.client.connect(self.mqtt_cfg["host"],
+                                 port=self.mqtt_cfg["port"], keepalive=60)
+        except (MQTTException, OSError) as e:
+            logger.error(f"MQTT connect failed: {e}")
+            if not self.connect_future.done():
+                self.connect_future.set_result(False)
+        return self.connect_future
     
     def start(self):
         """Start the MQTT bridge. Subscribe to the topics"""
@@ -444,22 +465,52 @@ class MQTT:
 
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
         """ Disconnection callback (paho-mqtt VERSION2 API). """
-        logger.debug(f"Disconnected from MQTT broker ({reason_code})")
-        asyncio.create_task(self.reconnect())
+        self.connected = False
+        logger.warning(f"Disconnected from MQTT broker ({reason_code}); reconnecting")
+        # Guard so repeated disconnects don't spawn several competing reconnect
+        # loops, each racing to reopen the socket.
+        if not self._reconnecting:
+            asyncio.create_task(self.reconnect())
 
     async def reconnect(self):
-        # We can't trust the client.is_connected() value here
-        # as it is not updated
-        is_connected = False        
-        while not is_connected:
-            try:
-                logger.debug("Reconnecting in 60s...")
-                await asyncio.sleep(60) 
-                is_connected = await self.connect()
-            except CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Error in MQTT: {str(e)}")
+        """Re-establish the MQTT connection with capped exponential backoff.
+
+        Improvements over the old fixed 60 s wait:
+          - retries almost immediately (1 s) so a brief Wi-Fi/broker blip
+            recovers in ~1 s instead of always costing >=60 s of downtime;
+          - exponential backoff 1->2->4...->60 s so a long outage doesn't
+            hammer the broker;
+          - reuses the existing paho client via client.reconnect() (keeps the
+            will, auth, TLS and asyncio socket wiring) instead of building a new
+            client every attempt, which leaked the old socket reader/writer
+            registrations and misc-loop task;
+          - single-flight: the _reconnecting guard ensures only one loop runs.
+        """
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        delay = 1
+        try:
+            while not (self.client is not None and self.client.is_connected()):
+                try:
+                    logger.info(f"Reconnecting to MQTT broker in {delay}s...")
+                    await asyncio.sleep(delay)
+                    # MUST run in the loop thread (not an executor): paho's
+                    # on_socket_open calls loop.add_reader(), which is not
+                    # thread-safe. reconnect() reuses host/port/keepalive and
+                    # all settings from the initial connect().
+                    self.client.reconnect()
+                    # is_connected() only flips True after the CONNACK arrives
+                    # in on_connect; give the loop a moment to process it.
+                    await asyncio.sleep(2)
+                except CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"MQTT reconnect attempt failed: {e}")
+                delay = min(delay * 2, 60)
+            logger.info("Reconnected to MQTT broker")
+        finally:
+            self._reconnecting = False
                 
     def normalize(self, address: str):
         normalized_name = address
