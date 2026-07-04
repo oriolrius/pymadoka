@@ -180,9 +180,38 @@ async def test_reconnect_reuses_client_and_stops_when_connected():
     m.client = MagicMock()
     # Not connected on entry, connected after the first client.reconnect().
     m.client.is_connected.side_effect = [False, True, True]
+    m.publish_discovery = AsyncMock()
     await m.reconnect()
     m.client.reconnect.assert_called_once()
     assert m._reconnecting is False  # guard released in finally
+
+
+@pytest.mark.asyncio
+async def test_reconnect_republishes_discovery():
+    """After the socket is back, reconnect() MUST re-publish the HA discovery
+    config. A broker restart drops all retained messages (incl. discovery), so
+    without this the AC shows 'unavailable' in HA forever even though the
+    bridge is up — the exact bug this fix targets."""
+    m = make_mqtt()
+    m.client = MagicMock()
+    m.client.is_connected.side_effect = [False, True, True]
+    m.publish_discovery = AsyncMock()
+    await m.reconnect()
+    m.publish_discovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_publish_discovery_publishes_config_sensors_and_availability():
+    """publish_discovery() must (re)send the climate discovery, the extra
+    sensor discovery, and the availability=online flag together."""
+    m = make_mqtt()  # controller.connection_status == CONNECTED
+    m.discovery = MagicMock()
+    m.discovery_sensors = MagicMock()
+    m.available = MagicMock()
+    await m.publish_discovery()
+    m.discovery.assert_called_once()
+    m.discovery_sensors.assert_called_once()
+    m.available.assert_called_once_with(True)
 
 
 def test_connect_sets_last_will():

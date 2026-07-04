@@ -509,9 +509,42 @@ class MQTT:
                     logger.warning(f"MQTT reconnect attempt failed: {e}")
                 delay = min(delay * 2, 60)
             logger.info("Reconnected to MQTT broker")
+            # Re-publish discovery + availability now that the socket is back.
+            # A broker restart drops ALL retained messages — including the
+            # retained HA discovery config — and on_connect can't republish
+            # without blocking the asyncio loop (it can't wait_for_publish to
+            # flush). Without this, HA loses the entity config after a broker
+            # blip and shows the AC 'unavailable' forever even though the bridge
+            # is up and publishing state.
+            try:
+                await self.publish_discovery()
+            except Exception as e:
+                logger.warning(f"discovery republish after reconnect failed: {e}")
         finally:
             self._reconnecting = False
-                
+
+    async def publish_discovery(self):
+        """(Re)publish HA discovery config, sensor configs and availability.
+
+        Called on the initial connect (from run()) AND after every MQTT
+        reconnect (from reconnect()). The reconnect case is what fixes the
+        "bridge up but HA shows unavailable" bug: a broker restart clears the
+        retained discovery message, so it must be re-sent or HA has nothing to
+        rebuild the entity from.
+
+        The asyncio.sleep() yields between batches let paho-asyncio's socket
+        writer callback flush each publish before the next — the same reason
+        on_connect delegates this here instead of publishing inline.
+        """
+        self.discovery()
+        await asyncio.sleep(0.5)
+        self.discovery_sensors()
+        await asyncio.sleep(1.0)
+        self.available(
+            self.controller.connection.connection_status == ConnectionStatus.CONNECTED
+        )
+        await asyncio.sleep(0.5)
+
     def normalize(self, address: str):
         normalized_name = address
         normalized_name = normalized_name.replace(" ","_")
@@ -1202,13 +1235,9 @@ async def run(ctx,verbose,adapter,log_output,debug,address,force_disconnect, dev
         # Publish discovery here (in async context), then yield to the loop so
         # paho-asyncio's socket writer callback runs and the bytes actually go
         # out before we move on. on_connect intentionally doesn't publish
-        # discovery (it can't wait for flush without blocking the loop).
-        mqtt_service.discovery()
-        await asyncio.sleep(0.5)
-        mqtt_service.discovery_sensors()
-        await asyncio.sleep(1.0)
-        mqtt_service.available(True)
-        await asyncio.sleep(0.5)
+        # discovery (it can't wait for flush without blocking the loop). The
+        # same method runs again after every reconnect (see reconnect()).
+        await mqtt_service.publish_discovery()
         logger.info("Discovery published; entering periodic update loop")
 
         update_task = asyncio.create_task(periodic_update(yml_config["daemon"]["update_interval"], madoka, mqtt_service))
