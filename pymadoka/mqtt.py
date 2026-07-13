@@ -4,6 +4,8 @@ from hashlib import new
 import logging
 import os
 import time
+import threading
+import socket
 import click
 import json
 import yaml
@@ -1010,6 +1012,114 @@ _BT_RESTART_AFTER = int(os.environ.get("MADOKA_BT_RESTART_AFTER", "5"))
 _EXIT_AFTER_S = int(os.environ.get("MADOKA_EXIT_AFTER_S", "300"))
 
 
+# ---------------------------------------------------------------------------
+# Out-of-loop liveness watchdog (defeats a full asyncio deadlock).
+#
+# The Layer-3 check inside periodic_update() (`elapsed > _EXIT_AFTER_S ->
+# os._exit`) runs INSIDE the event loop. If the loop itself deadlocks — e.g. a
+# bleak connect/cancel that never returns (`br-connection-canceled` /
+# `Failed to cancel connection`, seen in production 2026-07-13) — that check
+# never executes and the bridge hangs forever with no restart.
+#
+# This is a plain OS thread (not an asyncio task) so a wedged loop cannot freeze
+# it. periodic_update() calls _note_publish_success() on every successful
+# publish; if that timestamp goes stale past _HARD_EXIT_AFTER_S the loop is
+# presumed dead and we os._exit(1) — systemd `Restart=always` brings the bridge
+# back with a fresh BlueZ socket. It is the OS-thread twin of Layer 3, set a bit
+# higher so the in-loop exit (which first publishes availability=0) wins when the
+# loop is merely slow rather than deadlocked.
+#
+# It also feeds systemd's hardware-style watchdog when the unit is run as
+# `Type=notify` with `WatchdogSec=` (NOTIFY_SOCKET present): WATCHDOG=1 is sent
+# only while publishes are fresh, so a stuck loop trips systemd's own watchdog
+# too — a second, init-supervised line of defence. No-op if not under systemd.
+# ---------------------------------------------------------------------------
+_HARD_EXIT_AFTER_S = int(os.environ.get("MADOKA_HARD_EXIT_AFTER_S", str(2 * _EXIT_AFTER_S)))
+_LIVENESS_CHECK_INTERVAL_S = int(os.environ.get("MADOKA_LIVENESS_CHECK_INTERVAL_S", "30"))
+
+_last_publish_monotonic = time.monotonic()
+_last_publish_lock = threading.Lock()
+_liveness_thread_started = False
+
+
+def _note_publish_success():
+    """Record a successful publish. Called from the asyncio loop; read by the
+    watchdog OS thread. Cheap and lock-guarded so it's safe cross-thread."""
+    global _last_publish_monotonic
+    with _last_publish_lock:
+        _last_publish_monotonic = time.monotonic()
+
+
+def _sd_watchdog_setup():
+    """Return a datagram socket + address for systemd sd_notify, or (None, None).
+
+    Active only when the process runs under `Type=notify` (systemd exports
+    NOTIFY_SOCKET). Sends READY=1 immediately. Harmless otherwise."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return None, None
+    try:
+        if addr.startswith("@"):          # Linux abstract namespace socket
+            addr = "\0" + addr[1:]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(b"READY=1", addr)
+        except Exception:
+            pass
+        return sock, addr
+    except Exception as e:
+        logger.warning(f"sd_notify setup failed (continuing without it): {e}")
+        return None, None
+
+
+def _liveness_should_hard_exit(stale_seconds: float) -> bool:
+    """Pure predicate (unit-testable): has the publish clock gone stale past the
+    hard-exit threshold?"""
+    return stale_seconds > _HARD_EXIT_AFTER_S
+
+
+def _liveness_watchdog_loop():
+    notify_sock, notify_addr = _sd_watchdog_setup()
+    while True:
+        time.sleep(_LIVENESS_CHECK_INTERVAL_S)
+        with _last_publish_lock:
+            stale = time.monotonic() - _last_publish_monotonic
+        if _liveness_should_hard_exit(stale):
+            logger.error(
+                f"Liveness watchdog: no successful publish for {int(stale)} s "
+                f"(hard threshold {_HARD_EXIT_AFTER_S} s) — event loop appears "
+                f"deadlocked; hard-exiting so systemd restarts the bridge."
+            )
+            os._exit(1)
+        # Feed systemd's WatchdogSec only while healthy, so a stuck loop lets
+        # systemd's own watchdog trip (belt & suspenders alongside the exit above).
+        if notify_sock is not None and stale <= _EXIT_AFTER_S:
+            try:
+                notify_sock.sendto(b"WATCHDOG=1", notify_addr)
+            except Exception:
+                pass
+
+
+def start_liveness_watchdog():
+    """Start the out-of-loop watchdog thread (idempotent). Seed the publish
+    clock first so the deadline is measured from here, not import time."""
+    global _liveness_thread_started
+    if _liveness_thread_started:
+        return
+    _note_publish_success()
+    t = threading.Thread(
+        target=_liveness_watchdog_loop,
+        name="madoka-liveness-watchdog",
+        daemon=True,
+    )
+    t.start()
+    _liveness_thread_started = True
+    logger.info(
+        f"Liveness watchdog started (hard-exit after {_HARD_EXIT_AFTER_S} s "
+        f"without a publish; checking every {_LIVENESS_CHECK_INTERVAL_S} s)"
+    )
+
+
 async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
     """Schedule the periodic update of the controller, with watchdog recovery.
 
@@ -1054,9 +1164,11 @@ async def periodic_update(interval:int,controller:Controller,mqtt_service:MQTT):
                     status["bt"] = {"connected": None, "paired": None, "bonded": None,
                                     "trusted": None, "services_resolved": None}
                 mqtt_service.update(json.dumps(status, default=str))
-                # Success — reset watchdog state.
+                # Success — reset watchdog state (both the in-loop Layer-3 timer
+                # and the out-of-loop liveness thread).
                 consecutive_failures = 0
                 last_success = time.monotonic()
+                _note_publish_success()
             except ConnectionAbortedError as e:
                 logger.warning(f"BLE link aborted: {e}")
                 mqtt_service.available(False)
@@ -1239,6 +1351,11 @@ async def run(ctx,verbose,adapter,log_output,debug,address,force_disconnect, dev
         # same method runs again after every reconnect (see reconnect()).
         await mqtt_service.publish_discovery()
         logger.info("Discovery published; entering periodic update loop")
+
+        # Start the out-of-loop liveness watchdog now that we're about to enter
+        # the steady-state loop. It hard-exits if the loop ever deadlocks (the
+        # in-loop Layer-3 check can't catch that). See start_liveness_watchdog().
+        start_liveness_watchdog()
 
         update_task = asyncio.create_task(periodic_update(yml_config["daemon"]["update_interval"], madoka, mqtt_service))
         await update_task

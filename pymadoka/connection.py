@@ -17,6 +17,30 @@ from pymadoka.consts import NOTIFY_CHAR_UUID, WRITE_CHAR_UUID, SEND_MAX_TRIES
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling for any single bleak/BlueZ operation. Without this a wedged
+# connect / start_notify / disconnect (the `br-connection-canceled` /
+# `Failed to cancel connection` class of BlueZ failure) can block the asyncio
+# loop indefinitely, which in turn disables the in-loop watchdog. Wrapping each
+# op in asyncio.wait_for() turns a hang into a normal cycle failure that the
+# reconnect/watchdog machinery already knows how to handle. (The out-of-loop
+# liveness watchdog in mqtt.py is the final backstop for the pathological case
+# where bleak's own cancellation hangs.)
+import os as _os
+BLE_OP_TIMEOUT = float(_os.environ.get("MADOKA_BLE_OP_TIMEOUT", "60"))
+
+
+async def _with_timeout(coro, what: str, timeout: float = BLE_OP_TIMEOUT):
+    """Await `coro` but raise ConnectionException if it exceeds `timeout` seconds.
+
+    asyncio.wait_for cancels the wrapped coroutine on timeout; we surface it as a
+    ConnectionException so the periodic_update loop marks the unit unavailable and
+    forces a clean reconnect on the next cycle instead of blocking forever."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise ConnectionException(f"BLE op '{what}' timed out after {timeout:g}s")
+
+
 class ConnectionException(Exception):
     """Exceptions are documented in the same way as classes.
 
@@ -50,9 +74,9 @@ async def discover_devices(timeout=5,adapter="hci0", force_disconnect = True):
     global DISCOVERED_DEVICES_CACHE
 
     scanner = BleakScanner(adapter = adapter)
-    await scanner.start()
+    await _with_timeout(scanner.start(), "scanner.start")
     await asyncio.sleep(timeout)
-    await scanner.stop()
+    await _with_timeout(scanner.stop(), "scanner.stop")
     DISCOVERED_DEVICES_CACHE = scanner.discovered_devices
     return DISCOVERED_DEVICES_CACHE
 
@@ -65,12 +89,22 @@ async def force_device_disconnect(address):
 
     logger.debug("Forcing disconnect...")
     process = await asyncio.create_subprocess_exec(
-        "bluetoothctl","disconnect",address, 
-        stdout=asyncio.subprocess.PIPE, 
+        "bluetoothctl","disconnect",address,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
         )
-    # Wait for the subprocess to finish
-    stdout, stderr = await process.communicate()
+    # Wait for the subprocess to finish — but never block forever on a wedged
+    # bluetoothctl. On timeout, kill it and move on.
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=BLE_OP_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning(f"bluetoothctl disconnect timed out after {BLE_OP_TIMEOUT:g}s; killing it")
+        try:
+            process.kill()
+            await process.wait()
+        except Exception:
+            pass
+        return
     # Progress
     if process.returncode != 0:
         logger.debug(f"Disconnect failed: {stderr.decode().strip()}")
@@ -128,8 +162,8 @@ class Connection(TransportDelegate):
         
     async def cleanup(self):
         if self.client:
-            await self.client.stop_notify(NOTIFY_CHAR_UUID)
-            await self.client.disconnect()
+            await _with_timeout(self.client.stop_notify(NOTIFY_CHAR_UUID), "stop_notify")
+            await _with_timeout(self.client.disconnect(), "disconnect")
         self.connection_status = ConnectionStatus.DISCONNECTED
 
     async def start(self):
@@ -165,15 +199,18 @@ class Connection(TransportDelegate):
         try:
             connected = self.client.is_connected
             if not connected:
-                await self.client.connect()
+                await _with_timeout(self.client.connect(), "connect")
                 connected = self.client.is_connected
-                
+
             if connected:
                 logger.info(F"Connected to {self.address}")
                 # self.client.set_disconnected_callback(self.on_disconnect)
                 self.connection_status = ConnectionStatus.CONNECTED
-                await self.client.start_notify(
-                    NOTIFY_CHAR_UUID, self.notification_handler,
+                await _with_timeout(
+                    self.client.start_notify(
+                        NOTIFY_CHAR_UUID, self.notification_handler,
+                    ),
+                    "start_notify",
                 )
             else:
                 logger.info(f"Failed to connect to {self.address}")
@@ -253,7 +290,7 @@ class Connection(TransportDelegate):
                         cmd_response.cancel()
                         return cmd_response
                    
-                    await self.client.write_gatt_char(WRITE_CHAR_UUID,chunk)
+                    await _with_timeout(self.client.write_gatt_char(WRITE_CHAR_UUID,chunk), "write_gatt_char")
                     logger.debug(F"CMD {cmd_id}. Chunk #{chunknum+1}/{len(chunks)} sent with size {len(chunk)} bytes")
                     sent += 1
                     break
@@ -330,7 +367,7 @@ class Connection(TransportDelegate):
                 for char in service.characteristics:
                     if "read" in char.properties:
                         try:
-                            raw = await self.client.read_gatt_char(char.uuid)
+                            raw = await _with_timeout(self.client.read_gatt_char(char.uuid), "read_gatt_char")
                             value = None
                             
                             try:

@@ -393,3 +393,90 @@ def test_layer4_rotated_old_reboots_dont_block(tmp_path):
     # 2 reboots, both >24 h ago → don't count → breaker open → reboot.
     s.reboot_history = [now - 25 * 3600, now - 30 * 3600]
     assert _layer4_decide(s, now) == "reboot"
+
+
+# ---------------------------------------------------------------------------
+# Out-of-loop liveness watchdog (defeats a full asyncio deadlock).
+# ---------------------------------------------------------------------------
+
+import pymadoka.mqtt as _m
+from pymadoka.mqtt import (
+    _liveness_should_hard_exit,
+    _note_publish_success,
+    _sd_watchdog_setup,
+    start_liveness_watchdog,
+)
+
+
+def test_liveness_should_hard_exit_threshold():
+    assert _liveness_should_hard_exit(_m._HARD_EXIT_AFTER_S + 1) is True
+    assert _liveness_should_hard_exit(_m._HARD_EXIT_AFTER_S - 1) is False
+    assert _liveness_should_hard_exit(0) is False
+
+
+def test_hard_exit_threshold_is_looser_than_in_loop():
+    # The OS-thread backstop must fire AFTER the in-loop Layer-3 exit, so the
+    # graceful in-loop path (which publishes availability=0 first) wins when the
+    # loop is merely slow rather than deadlocked.
+    assert _m._HARD_EXIT_AFTER_S >= _m._EXIT_AFTER_S
+
+
+def test_note_publish_success_resets_staleness(monkeypatch):
+    clock = {"v": 1000.0}
+    monkeypatch.setattr(_m.time, "monotonic", lambda: clock["v"])
+    _note_publish_success()
+    # Advance well past the hard threshold → stale → would hard-exit.
+    clock["v"] = 1000.0 + _m._HARD_EXIT_AFTER_S + 5
+    stale = _m.time.monotonic() - _m._last_publish_monotonic
+    assert _liveness_should_hard_exit(stale) is True
+    # A fresh publish resets the clock → no longer stale.
+    _note_publish_success()
+    stale = _m.time.monotonic() - _m._last_publish_monotonic
+    assert _liveness_should_hard_exit(stale) is False
+
+
+def test_sd_watchdog_setup_noop_without_systemd(monkeypatch):
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    assert _sd_watchdog_setup() == (None, None)
+
+
+def test_start_liveness_watchdog_is_idempotent(monkeypatch):
+    monkeypatch.setattr(_m, "_liveness_thread_started", False)
+    created = []
+
+    class _FakeThread:
+        def __init__(self, *a, **k):
+            created.append(k.get("name"))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(_m.threading, "Thread", _FakeThread)
+    start_liveness_watchdog()
+    start_liveness_watchdog()  # second call must be a no-op
+    assert created == ["madoka-liveness-watchdog"]
+
+
+# ---------------------------------------------------------------------------
+# Hard timeouts around bleak/GATT calls (a hung op becomes a normal failure).
+# ---------------------------------------------------------------------------
+
+from pymadoka.connection import _with_timeout as _conn_with_timeout
+from pymadoka.connection import ConnectionException as _ConnException
+
+
+@pytest.mark.asyncio
+async def test_with_timeout_raises_connection_exception_on_hang():
+    async def _slow():
+        await asyncio.sleep(5)
+
+    with pytest.raises(_ConnException):
+        await _conn_with_timeout(_slow(), "slowop", timeout=0.05)
+
+
+@pytest.mark.asyncio
+async def test_with_timeout_passes_through_result():
+    async def _fast():
+        return 42
+
+    assert await _conn_with_timeout(_fast(), "fastop", timeout=5) == 42

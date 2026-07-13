@@ -2,13 +2,23 @@
 """
 
 from abc import ABC, abstractmethod
+import asyncio
 import logging
 import json
+import os
 from typing import Dict
 
 from asyncio.exceptions import CancelledError
 
 from pymadoka.connection import Connection, ConnectionException, ConnectionStatus
+
+# Max time to wait for a command's BLE notification response. Without this,
+# `await response` blocks forever when the device stops answering (BLE link
+# up but GATT silent — the "message could not be rebuilt" lock-up), which
+# freezes the whole update loop. On timeout we route into the existing
+# CancelledError cleanup path (pops the pending request, raises
+# ConnectionException) so the caller reconnects like any other command failure.
+_CMD_RESPONSE_TIMEOUT = float(os.environ.get("MADOKA_CMD_RESPONSE_TIMEOUT", "20"))
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +194,10 @@ class Feature(ABC):
            
              new_status = self.new_status()
              response = await self.connection.send(cmd_id, new_status.serialize())
-             await response
+             try:
+                 await asyncio.wait_for(response, timeout=_CMD_RESPONSE_TIMEOUT)
+             except asyncio.TimeoutError:
+                 raise CancelledError()  # -> cleanup below -> ConnectionException
              result = response.result()
              logger.debug(f"{self.__class__.__name__} QUERY response received ({len(result)} bytes)")
              new_status.parse(result)
@@ -245,7 +258,10 @@ class Feature(ABC):
         cmd_id = self.update_cmd_id()
         try:
              response = await self.connection.send(cmd_id, update_status.serialize())
-             await response
+             try:
+                 await asyncio.wait_for(response, timeout=_CMD_RESPONSE_TIMEOUT)
+             except asyncio.TimeoutError:
+                 raise CancelledError()  # -> cleanup below -> ConnectionException
              result = response.result()
              logger.debug(f"{self.__class__.__name__} UPDATE response received ({len(result)} bytes)")
              response_status = self.new_status()
